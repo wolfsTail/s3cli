@@ -52,6 +52,8 @@ func Run(argv []string) (int, error) {
 		return runRm(rest[1:], cfgPath, verbose)
 	case "put":
 		return runPut(rest[1:], cfgPath, verbose, !noProgress)
+	case "presign":
+		return runPresign(rest[1:], cfgPath, verbose)
 	case "stat":
 		return runStat(rest[1:], cfgPath, verbose)
 	case "cat":
@@ -685,6 +687,97 @@ func runGet(args []string, cfgPath string, verbose bool, showProgress bool) (int
 	return 0, nil
 }
 
+func runPresign(args []string, cfgPath string, verbose bool) (int, error) {
+	// presign get <alias>/<bucket>/<key> [--expire 15m]
+	// presign put <alias>/<bucket>/<key> [--expire 15m] [--content-type text/plain]
+	if len(args) == 0 {
+		return 4, fmt.Errorf("нужна подкоманду: get или put\n\n%s", presignUsage())
+	}
+	mode := args[0]
+	args = args[1:]
+
+	if len(args) == 0 {
+		return 4, fmt.Errorf("нужнен путь alias/bucket/key\n\n%s", presignUsage())
+	}
+
+	sp, err := parseS3Path(args[0])
+	if err != nil {
+		return 4, err
+	}
+	if sp.Key == "" {
+		return 4, fmt.Errorf("нужкн полный ключ объекта (префикс)")
+	}
+
+	expire := 15 * time.Minute
+	contentType := ""
+
+	// флаги
+	for i := 1; i < len(args); i++ {
+		switch args[i] {
+		case "--expire":
+			if i+1 >= len(args) {
+				return 4, fmt.Errorf("флаг --expire требует значение, пример: 15m, 1h")
+			}
+			d, err := time.ParseDuration(args[i+1])
+			if err != nil || d <= 0 {
+				return 4, fmt.Errorf("некорректный срок для --expire: %q", args[i+1])
+			}
+			expire = d
+			i++
+		case "--content-type":
+			if i+1 >= len(args) {
+				return 4, fmt.Errorf("флаг --content-type требует значение (например, text/plain)")
+			}
+			contentType = args[i+1]
+			i++
+		case "-h", "--help":
+			fmt.Print(presignUsage())
+			return 0, nil
+		default:
+			return 4, fmt.Errorf("неизвестный аргумент для presign: %q\n\n%s", args[i], presignUsage())
+		}
+	}
+
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		return 1, err
+	}
+	alias, err := cfg.GetAlias(sp.Alias)
+	if err != nil {
+		if errors.Is(err, config.ErrAliasNotFound) {
+			return 2, fmt.Errorf("ошибка: алиас %q не найден", sp.Alias)
+		}
+		return 1, err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	client, err := s3client.New(ctx, alias)
+	if err != nil {
+		return 1, err
+	}
+
+	switch mode {
+	case "get":
+		url, err := client.PresignGet(ctx, sp.Bucket, sp.Key, expire)
+		if err != nil {
+			return handleAWSError(err, verbose, "Не удалось сформировать ссылку", "Доступ запрещён")
+		}
+		fmt.Println(url)
+		return 0, nil
+	case "put":
+		url, err := client.PresignPut(ctx, sp.Bucket, sp.Key, contentType, expire)
+		if err != nil {
+			return handleAWSError(err, verbose, "Не удалось сформировать ссылку", "Доступ запрещён")
+		}
+		fmt.Println(url)
+		return 0, nil
+	default:
+		return 4, fmt.Errorf("неизвестная подкоманда presign: %q\n\n%s", mode, presignUsage())
+	}
+}
+
 func parseGlobalFlags(argv []string, cfgPath *string, verbose *bool, noProgress *bool) ([]string, error) {
 	out := make([]string, 0, len(argv))
 	for i := 0; i < len(argv); i++ {
@@ -719,6 +812,10 @@ func usageShort() string {
 	b.WriteString("  alias ls\n")
 	b.WriteString("  alias rm <name>\n\n")
 	b.WriteString("  ls <alias>/<bucket>/<prefix?>\n\n")
+	b.WriteString("  put put <local_path> <alias>/<bucket>/<key|prefix/> [-j N]\n\n")
+	b.WriteString("  get <alias>/<bucket>/<key|prefix/> <local_path> [-j N]\n\n")
+	b.WriteString("  presign get <alias>/<bucket>/<key> [--expire 15m]\n")
+	b.WriteString("  presign put <alias>/<bucket>/<key> [--expire 15m] [--content-type ...]\n")
 	b.WriteString("Глобальные флаги:\n")
 	b.WriteString("  --config PATH      Конфиг -> (по умолчанию ~/.s3cli/config.yaml)\n")
 	b.WriteString("  --no-progress      Отключить прогресс-бар\n")
@@ -876,3 +973,16 @@ func putUsage() string {
   -j N — число параллельных загрузок (по умолчанию 4).
 `
 }
+
+func presignUsage() string {
+	return `Использование:
+  s3cli presign get <alias>/<bucket>/<key> [--expire 15m]
+  s3cli presign put <alias>/<bucket>/<key> [--expire 15m] [--content-type text/plain]
+
+Описание:
+  Генерирует предварительно подписанные ссылки для скачивания (GET) или загрузки (PUT) без учётных данных.
+  --expire — срок действия ссылки (по умолчанию 15m).
+  --content-type — заголовок Content-Type для PUT (если нужен).
+`
+}
+
